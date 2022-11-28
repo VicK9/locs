@@ -12,9 +12,21 @@ from locs.models.global_to_local import Localizer
 from locs.models.local_to_global import Globalizer
 from locs.models.anisotropic_filter import AnisotropicEdgeFilter, MLPEdgeFilter
 
+# Note: This is the model that is used in the paper
+'''
+General Notes:
+dicts are used to store the parameters for each of the modules
+params.get('key', default) is used to get the value of a key in the dict
+if the key is not present, the default value is returned
 
+'''
 class LoCS(nn.Module):
     def __init__(self, params):
+        '''
+        Initialize the LoCS model, set the loss functions and the priors
+        Input:
+        params: dict containing the parameters for the model
+        '''
         super().__init__()
         # Model Params
 
@@ -48,8 +60,12 @@ class LoCS(nn.Module):
 
         if self.add_uniform_prior:
             if params.get('no_edge_prior') is not None:
+                # The no_edge_prior is 0.9 at least in the case of the synthetic dataset using LoCS
                 prior = np.zeros(self.num_edge_types)
+                # Here we set the edges prior 
                 prior.fill((1 - params['no_edge_prior'])/(self.num_edge_types - 1))
+                # Fot the first edge type, we set the prior to be the no_edge_prior
+                # WHY??
                 prior[0] = params['no_edge_prior']
                 log_prior = torch.FloatTensor(np.log(prior))
                 log_prior = torch.unsqueeze(log_prior, 0)
@@ -62,6 +78,8 @@ class LoCS(nn.Module):
                 print("USING UNIFORM PRIOR")
                 prior = np.zeros(self.num_edge_types)
                 prior.fill(1.0/self.num_edge_types)
+                # When uniform prior is used everything has the same probability
+                # which is 1/num_edge_types
                 log_prior = torch.FloatTensor(np.log(prior))
                 log_prior = torch.unsqueeze(log_prior, 0)
                 log_prior = torch.unsqueeze(log_prior, 0)
@@ -71,6 +89,28 @@ class LoCS(nn.Module):
 
     def single_step_forward(self, inputs, decoder_hidden, edge_logits,
                             hard_sample):
+        '''
+        Do a single step of the decoder by sampling the edges using the
+        gumbel softmax. Then use the sampled edges as input to the decoder
+        where it outputs the next hidden state and the next edge logits.
+        
+        Notes to self:
+        Q: Why do we need to sample the edges?
+        A: Because we want to sample the edges from the posterior distribution(??? Ask Miltos about this)
+        Q: What is the gumbel softmax?
+        A: Gumbel softmax is a way to sample from a categorical distribution
+        Q: What is the purpose of the temperature (gumbel_temp) in the gumbel softmax?
+        A: The temperature is used to control the sharpness of the distribution
+           (the higher the temperature, the more uniform the distribution, 
+           the lower the temperature, the more sharp the distribution)
+        
+        Input:
+        self: the model
+        inputs: the input to the decoder
+        decoder_hidden: the hidden state of the decoder
+        edge_logits: the logits of the edges
+        hard_sample: whether to sample from the logits or use the argmax
+        '''
         old_shape = edge_logits.shape
         edges = model_utils.gumbel_softmax(
             edge_logits.reshape(-1, self.num_edge_types),
@@ -80,6 +120,25 @@ class LoCS(nn.Module):
         return predictions, decoder_hidden, edges
 
     def calculate_loss(self, inputs, is_train=False, teacher_forcing=True, return_edges=False, return_logits=False, use_prior_logits=False):
+        '''
+        In this function is the forward pass of the model
+        Input:
+        self: the model
+            inputs: the input to the model
+            is_train: whether the model is trained or evaluated
+            teacher_forcing: whether to use the ground truth labels or the predicted labels as input to the decoder
+            return_edges: whether to return the sampled edges
+            return_logits: whether to return the logits of the edges
+            use_prior_logits: whether to use the prior logits or the posterior logits
+        Output:
+            loss: the loss of the model
+            loss_nll: the negative log likelihood loss
+            loss_kl: the kl divergence loss
+            edges: the sampled edges (if return_edges is True)
+            posterior_logits: the logits of the posterior distribution (if return_logits is True)
+            all_predictions: the predictions of the model (if return_logits is True)
+            
+        '''
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         num_time_steps = inputs.size(1)
         all_edges = []
@@ -122,11 +181,21 @@ class LoCS(nn.Module):
             return loss, loss_nll, loss_kl
 
     def predict_future(self, inputs, prediction_steps, return_edges=False, return_everything=False):
+        '''
+        In this function the model is used to predict the future for the
+        the next N_{preditction steps}. The posterior distribution is used to
+        sample the edges and then the sampled edges are used as input
+        to the decoder. Then the decoder outputs the next hidden state
+        which is used to sample the edges and so on. 
+        '''
         burn_in_timesteps = inputs.size(1)
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         all_predictions = []
         all_edges = []
         prior_logits, _, prior_hidden = self.encoder(inputs[:, :-1])
+        # Here is the burn in phase where the number of timesteps is equal to the number of timesteps in the input
+        # In this phase the edges are sampled from the prior distribution
+        # which is the output of the encoder (prior_logits). The encoder is only used to encode the input once and not in the for loop
         for step in range(burn_in_timesteps-1):
             current_inputs = inputs[:, step]
             current_edge_logits = prior_logits[:, step]
@@ -134,6 +203,10 @@ class LoCS(nn.Module):
             if return_everything:
                 all_edges.append(edges)
                 all_predictions.append(predictions)
+        # Now we have to predict the future where the number of timesteps is givrn as input
+        # In every step of the for loop the edges the predictions and the prior hidden state are used as input to the encoder
+        # The ecoder outputs the posterior logits and the posterior hidden state which are used as input to the decoder.
+        # The decoder outputs the predictions and the posterior hidden state which are used as input to the encoder and the edges and so on.
         predictions = inputs[:, burn_in_timesteps-1]
         for step in range(prediction_steps):
             current_edge_logits, prior_hidden = self.encoder.single_step_forward(predictions, prior_hidden)
@@ -223,10 +296,16 @@ class Encoder(nn.Module):
         rnn_hidden_size = params['encoder_rnn_hidden']
         rnn_type = params['encoder_rnn_type']
         inp_size = params['input_size']
+        # The MLPs are defined in the model_builder.py file and they are used to encode the input data
         self.mlp3 = RefNRIMLP(hidden_size, hidden_size, hidden_size, dropout, no_bn=no_bn)
         self.mlp4 = RefNRIMLP(hidden_size * 3, hidden_size, hidden_size, dropout, no_bn=no_bn)
         self.res1 = nn.Linear(inp_size, hidden_size)
 
+        # The encoder uses two RNNs:
+        # 1. The first RNN (forward in time) is used to compute the prior 
+        # 2. The second RNN (backwards in time) is used with the hidden state of the first RNN (concatenated)
+        #    to compute the encoder distribution (encoder_fc_out)
+        # out_hidden_size is the size of the hidden state of the RNNs concatenated thus 2*rnn_hidden_size
         if rnn_hidden_size is None:
             rnn_hidden_size = hidden_size
         if rnn_type == 'lstm':
@@ -236,6 +315,9 @@ class Encoder(nn.Module):
             self.forward_rnn = nn.GRU(hidden_size, rnn_hidden_size, batch_first=True)
             self.reverse_rnn = nn.GRU(hidden_size, rnn_hidden_size, batch_first=True)
         out_hidden_size = 2*rnn_hidden_size
+        # Depending on the design the concatenated hidden states are either passed through ONE linear layer or
+        # or through an MLP with nn.Linear modules followd by a ELU activation
+        # to compute the encoder distribution (encoder_fc_out)
         num_layers = params['encoder_mlp_num_layers']
         if num_layers == 1:
             self.encoder_fc_out = nn.Linear(out_hidden_size, self.num_edges)
@@ -247,7 +329,9 @@ class Encoder(nn.Module):
                 layers.append(nn.ELU(inplace=True))
             layers.append(nn.Linear(tmp_hidden_size, self.num_edges))
             self.encoder_fc_out = nn.Sequential(*layers)
-
+        # Depending on the design the hidden state of first RNN is either passed through ONE linear layer or
+        # or through an MLP with nn.Linear modules followd by a ELU activation
+        # to compute the prior distribution (prior_fc_out)
         num_layers = params['prior_num_layers']
         if num_layers == 1:
             self.prior_fc_out = nn.Linear(rnn_hidden_size, self.num_edges)
@@ -264,14 +348,14 @@ class Encoder(nn.Module):
         edges = np.ones(num_vars) - np.eye(num_vars)
         self.send_edges = np.where(edges)[0]
         self.recv_edges = np.where(edges)[1]
-
+        # WHY???????
         self.use_3d = params.get('use_3d', False)
         self.num_relative_features = 12 if self.use_3d else 7
         self.num_pos_features = 6 if self.use_3d else 3
         self.edge_filter = AnisotropicEdgeFilter(
             self.num_relative_features+inp_size, self.num_pos_features,
             hidden_size, hidden_size, hidden_size, do_prob=dropout, bn=not no_bn)
-
+        # Localizer is a nn.Module in the global_to_local.py file
         self.localizer = Localizer(params)
 
         self.init_weights()

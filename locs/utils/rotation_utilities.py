@@ -215,3 +215,9 @@ def angle_diff(v1, v2):
     delta_angle[delta_angle < -np.pi] += 2 * np.pi
     delta_angle = delta_angle / np.pi
     return delta_angle
+
+
+'''
+NOTES:
+trans_only: means only translation (i.e that the rotation matrix is not applied)
+'''
